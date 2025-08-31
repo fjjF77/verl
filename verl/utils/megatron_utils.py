@@ -673,6 +673,7 @@ def default_tp_concat_fn(
     """
     name: name of the parameter
     train_params: training parameters
+    # ？？？infer_params真的是micro_dp_group聚合后的权重吗，看底下代码怎么是从tensor_model_parallel_group聚合的，甚至连是不是infer的group都不知道？
     infer_params (Iterable[torch.Tensor]): a iterator towards list of parameters all-gathered from micro_dp_group
     model_config: huggingface model_config
     TODO(zhangchi.usc1992): currently, the implementation is adhoc. We can move this function to the model
@@ -683,6 +684,7 @@ def default_tp_concat_fn(
 
     train_tp_size = mpu.get_tensor_model_parallel_world_size()
     if layer_name_mapping.get("qkv_layer_name") in name and "layer_norm" not in name:
+        # 支持fused_qkv，通过讲fused_qkv进行拆分，然后
         # if the tensor is qkv, for each param on tp, split into q, k, v
         # concat q, k, v separately.
         q_lst = []
@@ -698,11 +700,13 @@ def default_tp_concat_fn(
         assert infer_params[0].shape[0] % (num_q_per_kv + 2) == 0, (
             f"param '{name}' shape '{infer_params[0].shape}' dim0 is not divisible by {num_q_per_kv + 2}"
         )
+        # (num_q_per_kv + 2)是指fused_qkv的元素数量，下面这一行应该是求每张卡的kv的特征维大小
         kv_size_per_tp = infer_params[0].shape[0] // (num_q_per_kv + 2)
         split_size = [kv_size_per_tp * num_q_per_kv, kv_size_per_tp, kv_size_per_tp]
         for infer_param in infer_params:
+            # 每张卡训练时的KV头数
             num_query_groups_per_partition = num_key_value_heads // train_tp_size
-            for chunk in infer_param.chunk(num_query_groups_per_partition):
+            for chunk in infer_param.chunk(num_query_groups_per_partition): # 分出来的chunk是每张卡训练时的fuse_qkv权重
                 split_size = [
                     kv_size_per_tp * num_q_per_kv // num_query_groups_per_partition,
                     kv_size_per_tp // num_query_groups_per_partition,
@@ -763,6 +767,7 @@ def per_tensor_generator(
     all_gather_group_size = torch.distributed.get_world_size(group=all_gather_group)
 
     def tensor_generator():
+        # 获取张量名字及参数
         for scan_vpp_idx in range(vpp_size):
             existing_keys = set()
             model = unwrap_model(actor_module[scan_vpp_idx])
@@ -778,6 +783,7 @@ def per_tensor_generator(
                 yield name, model.state_dict()[name].to(get_device_id())
 
     # we need first make all rank get full model information
+    # 获取PP组的所有张量meta信息
     meta_info = []
     for scan_vpp_idx in range(vpp_size):
         existing_keys = set()
@@ -845,17 +851,18 @@ def per_tensor_generator(
                 else:
                     params = [param]
 
-                merge_params = default_tp_concat_fn(
+                merge_params = default_tp_concat_fn( # ？？？
                     layer_name_mapping,
                     name,
-                    broad_pp_tensor,
-                    params,
+                    broad_pp_tensor, # train_param
+                    params, # infer_param
                     model_config,
                     weight_converter.hf_config,
                     convert_qkv_gate_up_by_simple_split,
                 )
                 if not isinstance(merge_params, list):
                     merge_params = [merge_params]
+                # weight_converter就是给模型参数换个名字，适配不同引擎的需要
                 converted_names, converted_params = weight_converter.convert_param(name, merge_params)
 
                 yield from zip(converted_names, converted_params, strict=True)
@@ -868,6 +875,7 @@ def per_tensor_generator(
                 infer_params = [broad_pp_tensor]
             else:
                 infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(all_gather_group_size)]
+                # ？？？ oh No！这是把所有TP组聚合再一块吗
                 torch.distributed.all_gather(infer_params, broad_pp_tensor, group=mpu.get_tensor_model_parallel_group())
             infer_params = default_tp_concat_fn(
                 layer_name_mapping,

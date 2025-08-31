@@ -1083,6 +1083,11 @@ class RayPPOTrainer:
                     self._start_profiling(do_profile)
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                
+                import os
+                pid = os.getpid()
+                # print(f"FU [Pid{pid}] batch:{batch}")
+                print(f"Fu [Pid{pid}] batch size: {batch.batch['input_ids'].shape} \n\n\n\n"+"="*30, flush=True)
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1118,6 +1123,16 @@ class RayPPOTrainer:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        
+                        import os # 查看生成的输出是否在不同的进程，这应该会涉及数据传输？
+                        pid = os.getpid()
+                        import torch
+                        try:
+                            rank = torch.distributed.get_rank()
+                        except ValueError:
+                            rank = None
+                        print(f"Fu [Pid{pid}, rank{rank}] in ray_trainer, gen_batch_output:{gen_batch_output.batch.batch_size}")
+
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -1175,6 +1190,15 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        import os
+                        pid = os.getpid()
+                        import torch
+                        try:
+                            rank = torch.distributed.get_rank()
+                        except ValueError:
+                            rank = None
+                        print(f"Fu [Pid{pid}, rank{rank}] (in ray_trainer) before compute_log_prob, batch:{batch.batch.batch_size}")
+
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
@@ -1248,6 +1272,15 @@ class RayPPOTrainer:
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
+                        
+                        import os
+                        pid = os.getpid()
+                        import torch
+                        try:# 验证compute adv是否在主进程上
+                            rank = torch.distributed.get_rank()
+                        except ValueError:
+                            rank = None 
+                        print(f"Fu [Pid{pid}, rank{rank}] (in ray_trainer.fit) before compute_advantage, batch bs:{batch.batch.batch_size}, batch:{batch.batch}")
 
                         batch = compute_advantage(
                             batch,
@@ -1271,6 +1304,16 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            
+                            import os
+                            pid = os.getpid()
+                            import torch
+                            try:
+                                rank = torch.distributed.get_rank()
+                            except ValueError:
+                                rank = None
+                            print(f"Fu [Pid{pid}, rank{rank}] (in ray_trainer.fit) before update_actor, batch bs:{batch.batch.batch_size}, device:{batch.batch}")
+
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

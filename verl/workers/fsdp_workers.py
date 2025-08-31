@@ -140,6 +140,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
             )
 
+        print(f"Fu before create FSDPUlyssesShardingManager, device_mesh:{self.device_mesh}")
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0
@@ -505,6 +506,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
             full_params = torch.distributed.get_world_size() == 1
+            print(f"Fu before create rollout_sharing_manager, rollout_device_mesh:{rollout_device_mesh}")
+            # breakpoint()
             rollout_sharding_manager = FSDPVLLMShardingManager(
                 module=self.actor_module_fsdp,
                 inference_engine=rollout.inference_engine,
@@ -532,7 +535,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             local_path = copy_to_local(self.config.model.path)
             log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
-            rollout = SGLangRollout(
+            rollout = SGLangRollout( # infer TP组rank0 engine有值，其他rank为None，看代码其他基本一样？
                 actor_module=local_path,
                 config=self.config.rollout,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
@@ -715,6 +718,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
+        import os
+        pid = os.getpid()
+        print(f"Fu [Pid{pid}] before generate prompts size: {prompts.batch.batch_size}, batch:{prompts.batch}")
+
+        # breakpoint() # 查看该函数是否有dispatch_mode属性，以及什么时候执行的
         # Support all hardwares
         prompts = prompts.to(get_device_id())
 
@@ -734,12 +742,51 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+
+            import os
+            pid = os.getpid()
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"Fu [Pid{pid}, rank{rank}] after preprocess_data, prompts:{prompts.batch.batch_size}, device:{prompts.batch}")
+            ''' ？？？怎么不同卡预处理出来的维度不一样啊？
+            Fu [Pid47079, rank0] after preprocess_data, prompts:torch.Size([2048]), device:TensorDict(
+[36m(WorkerDict pid=47079)[0m         attention_mask: Tensor(shape=torch.Size([2048, 4096]), device=cuda:0, dtype=torch.int64, is_shared=True),
+[36m(WorkerDict pid=47079)[0m         input_ids: Tensor(shape=torch.Size([2048, 4096]), device=cuda:0, dtype=torch.int64, is_shared=True),
+[36m(WorkerDict pid=47079)[0m         position_ids: Tensor(shape=torch.Size([2048, 4096]), device=cuda:0, dtype=torch.int64, is_shared=True)},
+[36m(WorkerDict pid=47079)[0m     batch_size=torch.Size([2048]),
+[36m(WorkerDict pid=47079)[0m     device=cuda:0,
+[36m(WorkerDict pid=47079)[0m     is_shared=True)
+
+            Fu [Pid47346, rank3] after preprocess_data, prompts:torch.Size([2048]), device:TensorDict([32m [repeated 3x across cluster][0m
+[36m(WorkerDict pid=47079)[0m         attention_mask: Tensor(shape=torch.Size([1024, 8192]), device=cuda:0, dtype=torch.int64, is_shared=True),[32m [repeated 8x across cluster][0m
+[36m(WorkerDict pid=47079)[0m         input_ids: Tensor(shape=torch.Size([1024, 8192]), device=cuda:0, dtype=torch.int64, is_shared=True),[32m [repeated 8x across cluster][0m
+[36m(WorkerDict pid=47346)[0m         position_ids: Tensor(shape=torch.Size([2048, 4096]), device=cuda:0, dtype=torch.int64, is_shared=True)},[32m [repeated 6x across cluster][0m
+[36m(WorkerDict pid=47346)[0m     is_shared=True)[32m [repeated 6x across cluster][0m
+            '''
+            
             with simple_timer("generate_sequences", timing_generate):
                 output = self.rollout.generate_sequences(prompts=prompts)
-
+            
             log_gpu_memory_usage("After rollout generation", logger=logger)
 
+            import os
+            pid = os.getpid()
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"Fu [Pid{pid}, rank{rank}] out generate_sequence & after generate_sequences, outputs:{output.batch.batch_size}, device:{output.batch}")
+            # ？？？ Fu [Pid114058, rank2] out generate_sequence & after generate_sequences, outputs:torch.Size([64]), device:TensorDict(
+            # (WorkerDict pid=114058)         position_ids: Tensor(shape=torch.Size([64, 768]), device=cuda:0, dtype=torch.int64, is_shared=True),
+            # (WorkerDict pid=114058)         prompts: Tensor(shape=torch.Size([64, 512]), device=cuda:0, dtype=torch.int64, is_shared=True),
+            # (WorkerDict pid=114058)         responses: Tensor(shape=torch.Size([64, 256]), device=cuda:0, dtype=torch.int64, is_shared=True)},
+            # (WorkerDict pid=114058)     batch_size=torch.Size([64]),
+            
             output = self.rollout_sharding_manager.postprocess_data(output)
+            
+            import os
+            pid = os.getpid()
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"Fu [Pid{pid}, rank{rank}] after postprocess_data, output:{output.batch.batch_size}, device:{output.batch}")
 
         timing_generate.update(self.rollout_sharding_manager.timing)
         # We calculate the average timing across all ranks
@@ -758,7 +805,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
-        if self._is_offload_param:
+        if self._is_offload_param: # 为什么每个操作都要offload param？
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         # Support all hardwares
@@ -774,16 +821,46 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
+            import os
+            pid = os.getpid()
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"""Fu [Pid{pid}, rank{rank}] (in fsdp_workers.compute_logprob) before ulysses_sharding_manager.preprocess_data, 
+                  data:{data.batch.batch_size}, device:{data.batch}""")
+
             data = self.ulysses_sharding_manager.preprocess_data(data)
+
+            import os
+            pid = os.getpid()
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"""Fu [Pid{pid}, rank{rank}] (in fsdp_workers.compute_logprob) after ulysses_sharding_manager.preprocess_data, 
+                  data:{data.batch.batch_size}, device:{data.batch}""")
+            
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
             )
+
+            import os
+            pid = os.getpid()
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"""Fu [Pid{pid}, rank{rank}] (in fsdp_workers.compute_logprob) before ulysses_sharding_manager.postprocess_data, 
+                  output:{output.batch.batch_size}, device:{output.batch}""")
+            
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
-        output = output.to("cpu")
+            import os
+            pid = os.getpid()
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"""Fu [Pid{pid}, rank{rank}] (in fsdp_workers.compute_logprob) after ulysses_sharding_manager.postprocess_data, 
+                  output:{output.batch.batch_size}, device:{output.batch}""")
+
+        output = output.to("cpu") # 这里为什么要挪到cpu上？
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
@@ -793,6 +870,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
+
+        import os
+        pid = os.getpid()
+        import torch
+        rank = torch.distributed.get_rank()
+        print(f"Fu [Pid{pid}, rank{rank}] (in fsdp_worker.compuet_logprob) before return, output:{output.batch.batch_size}, device:{output.batch}")
 
         return output
 
@@ -829,6 +912,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # unshard the root FSDP module
         if self.world_size > 1 and fsdp_version(self.ref_policy.actor_module) == 1:
             self.ref_policy.actor_module._handle.reshard(True)
+
+        import os
+        pid = os.getpid()
+        import torch
+        rank = torch.distributed.get_rank()
+        print(f"Fu [Pid{pid}, rank{rank}] (in fsdp_worker.compuet_ref_logprob) after compute_ref_log_prob, output bs:{output.batch.batch_size}, device:{output.batch}")
 
         return output
 

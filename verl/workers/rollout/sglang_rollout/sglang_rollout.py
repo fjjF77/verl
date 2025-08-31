@@ -82,6 +82,8 @@ except ImportError:
     from sglang.srt.openai_api.protocol import Tool
 
 
+from utils.fu_learn_utils import print_debug
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -169,7 +171,7 @@ class AsyncEngine(sglang.srt.entrypoints.engine.Engine):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
+            serialized_named_tensors=[ # 这里输入的named_tensors应该已经是全部TP的tensor了，为什么还要循环tp遍进行序列化？
                 MultiprocessingSerializer.serialize(named_tensors) for _ in range(self.server_args.tp_size)
             ],
             load_format=load_format,
@@ -413,6 +415,7 @@ class SGLangRollout(BaseRollout):
             self.config.multi_turn.max_user_turns = self.config.max_model_len // 3
 
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
+        # 似乎是mook实现的伪SMPD形式，即TP组rank0上有Egine，其他rank上为None
         # initialize the inference engine
         nnodes = -(-self._tp_size // len(self.visible_devices_set))
         if nnodes > 1:
@@ -572,6 +575,12 @@ class SGLangRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        import os
+        pid = os.getpid()
+        import torch
+        rank = torch.distributed.get_rank()
+        print(f"Fu [Pid{pid}, rank{rank}] (in sglang_rollout.generate_sequences) before generate_sequences, prompts:{prompts.batch.batch_size}, batch:{prompts.batch}")
+            
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
@@ -711,7 +720,7 @@ class SGLangRollout(BaseRollout):
         if self._tp_rank == 0:
             loop = asyncio.get_event_loop()
             output = loop.run_until_complete(
-                self._engine.async_generate(
+                self._engine.async_generate( # ？？？即只有inferTP rank0会实际调用生成函数，其他rank不会。这里数据传输是怎样的？
                     prompt=None,  # because we have already convert it to prompt token id
                     sampling_params=request_sampling_params,
                     return_logprob=True,
@@ -793,6 +802,7 @@ class SGLangRollout(BaseRollout):
         is_validate: bool = False,
         **kwargs,
     ) -> AsyncRolloutRequest:
+        # 基于request生成回复，只有infer TP rank0会调用
         assert self._tp_rank == 0, "only the master process can call this function"
         _req = deepcopy(req)
         finish_reason_type = None
@@ -833,7 +843,8 @@ class SGLangRollout(BaseRollout):
 
         # Update with any additional kwargs
         request_sampling_params.update(kwargs)
-
+        
+        # 维护一个状态机管理多轮的对话
         while current_turns < self.config.multi_turn.max_assistant_turns:
             if _req.state == AsyncRolloutRequestStateEnum.PENDING:
                 await self._handle_pending_state(_req)
@@ -843,7 +854,7 @@ class SGLangRollout(BaseRollout):
                     parsed_tool_calls = _req.messages[-1].tool_calls
                     tool_call_results = await asyncio.gather(
                         *[
-                            self._tool_map[tool_call.function.name].execute(
+                            self._tool_map[tool_call.function.name].execute( # 执行工具调用，可能是异步同时执行的？
                                 _req.request_id,
                                 tool_call.function.arguments,
                                 **_req.tools_kwargs[tool_call.function.name].get("execute_kwargs", {}),
@@ -864,7 +875,7 @@ class SGLangRollout(BaseRollout):
                 # Only continue the conversation if the prompt length is not greater than max_model_len - 1,
                 # since SGLang raises an error when max_new_tokens + 1 is greater to max_model_len (the extra
                 # token accounts for the EOS token).
-                if len(_req.get_generation_prompt_ids(self.processing_class)) + 1 >= self.config.max_model_len:
+                if len(_req.get_generation_prompt_ids(self.processing_class)) + 1 >= self.config.max_model_len: # 超出长度截止
                     finish_reason_type = FinishReasonTypeEnum.LENGTH
                     break
 
@@ -884,6 +895,7 @@ class SGLangRollout(BaseRollout):
                         "video support is not implemented yet, current length of video data is %d", len(video_data)
                     )
 
+                # 阻塞调用处理函数，得到该步的输出
                 output = await self._handle_engine_call(_req, request_sampling_params, image_data=image_data)
                 content = output["text"]
                 finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
@@ -891,12 +903,12 @@ class SGLangRollout(BaseRollout):
                 if finish_reason_type == FinishReasonTypeEnum.LENGTH:
                     _req.add_assistant_message(self.processing_class, content)
                     break
-                else:
-                    if self._function_call_parser and self._function_call_parser.has_tool_call(content):
+                else: # 只要不是长度限制，就默认需要调用工具
+                    if self._function_call_parser and self._function_call_parser.has_tool_call(content): # 检测当前一步结果是否是调用工具
                         finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
                         _req.state = AsyncRolloutRequestStateEnum.TOOL_CALLING
                         try:
-                            normed_content, tool_calls = self._function_call_parser.parse_non_stream(content)
+                            normed_content, tool_calls = self._function_call_parser.parse_non_stream(content) # 工具调用输入准备？
                         except JSONDecodeError:
                             normed_content = content
                             tool_calls = []
@@ -910,7 +922,7 @@ class SGLangRollout(BaseRollout):
                                     name=tool_call.name,
                                     arguments=tool_call.parameters,
                                 )
-                            )
+                            ) # function是什么玩意？
                             # Drop the tool call if its arguments has decode error
                             if has_decode_error:
                                 continue
@@ -921,6 +933,16 @@ class SGLangRollout(BaseRollout):
                                 )
                             )
                         if len(parsed_tool_calls) > 0:
+                            import os
+                            pid = os.getpid()
+                            import torch
+                            try:
+                                rank = torch.distributed.get_rank()
+                            except ValueError:
+                                rank = None
+                            print(f"""Fu [Pid{pid}, rank{rank}] (in SGLangRollout._async_roolout_a_request) after create parsed_tool_calls, 
+                            normed_content:{normed_content},  parsed_tool_calls={parsed_tool_calls}""")
+
                             _req.add_assistant_message(
                                 self.processing_class, normed_content, tool_calls=parsed_tool_calls
                             )
@@ -940,7 +962,7 @@ class SGLangRollout(BaseRollout):
                             and user_turns < self.config.multi_turn.max_user_turns
                             and current_turns < self.config.multi_turn.max_assistant_turns
                         ):
-                            _req.state = AsyncRolloutRequestStateEnum.INTERACTING
+                            _req.state = AsyncRolloutRequestStateEnum.INTERACTING # 交互
                         else:
                             break
             elif _req.state == AsyncRolloutRequestStateEnum.INTERACTING:
@@ -948,6 +970,7 @@ class SGLangRollout(BaseRollout):
                 messages = [{"role": x.role, "content": x.content} for x in _req.messages]
 
                 # Get interaction by name from interaction_kwargs
+                # 这里的交互怎么这么奇怪呢？
                 interaction_name = _req.interaction_kwargs.get(
                     "name", "gsm8k"
                 )  # Default to gsm8k for backward compatibility
@@ -983,6 +1006,7 @@ class SGLangRollout(BaseRollout):
             await tool.release(_req.request_id, **_req.tools_kwargs[name].get("release_kwargs", {}))
             return name, reward
 
+        # 获取工具调用结果奖励
         tool_reward_tasks = []
         for name in _req.tools_kwargs.keys():
             tool = self._tool_map[name]
@@ -1016,13 +1040,15 @@ class SGLangRollout(BaseRollout):
         return output
 
     async def _handle_pending_state(self, _req: AsyncRolloutRequest) -> AsyncRolloutRequest:
+        # ？？？感觉像是加载工具环境或者交互任务环境？
         if _req.tool_schemas is not None:
             tool_creation_coroutines = []
             for tool_schema in _req.tool_schemas:
                 tool = self._tool_map[tool_schema.function.name]
                 create_kwargs = _req.tools_kwargs[tool.name].get("create_kwargs", {})
+                # 创建工具实例，其实就是内部维护了一个输入输出奖励表，创建了request_id这一项
                 tool_creation_coroutines.append(tool.create(_req.request_id, **create_kwargs))
-            await asyncio.gather(*tool_creation_coroutines)
+            await asyncio.gather(*tool_creation_coroutines) # 等待全部工具实例创建完成
         if _req.interaction_kwargs and self.interaction_map:
             interaction_kwargs = _req.interaction_kwargs
             # Get interaction by name from interaction_kwargs
@@ -1059,17 +1085,29 @@ class SGLangRollout(BaseRollout):
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         tgt_device = prompts.batch["input_ids"].device
-        if self._tp_rank == 0:
+
+        # 查看各个卡上的prompts输入
+        print_debug({'prompts': prompts}, in_func_name="SGLangRollout._req_level_generate_sequences",
+            annotate_str="before _req_level_generate_sequences",has_bs=True,has_value=True)
+        
+        if self._tp_rank == 0: 
+            # 只有infer TP rank 0需要处理数据
             req_list = self._preprocess_prompt_to_async_rollout_requests(
                 prompts,
             )
-            loop = asyncio.get_event_loop()
+            print_debug({'req_list': req_list}, in_func_name="SGLangRollout._req_level_generate_sequences",
+                annotate_str="after _preprocess_prompt_to_async_rollout_requests",has_bs=True,has_value=True)
+            
+            loop = asyncio.get_event_loop() # 异步管理请求这些request
             output_req_list = loop.run_until_complete(
                 asyncio.gather(
                     *[self._async_rollout_a_request(req, do_sample, is_validate, **kwargs) for req in req_list],
                 )
             )
             sorted_output_req_list = sorted(output_req_list, key=lambda x: (x.batch_data_id, x.rollout_offset))
+
+            print_debug({'sorted_output_req_list': sorted_output_req_list}, in_func_name="SGLangRollout._req_level_generate_sequences",
+                annotate_str="after asyncio.gather async_rollout_a_request lst",has_bs=False,has_value=True)
         else:
             sorted_output_req_list = None
 
@@ -1081,6 +1119,9 @@ class SGLangRollout(BaseRollout):
             src=self._device_mesh_cpu["tp"].mesh[0].item(),
             force_cpu_device=False,
         )
+        print_debug({'sorted_output_req_list': sorted_output_req_list}, in_func_name="SGLangRollout._req_level_generate_sequences",
+                annotate_str="after broadcast_pyobj",has_bs=True,has_value=False)
+                
         # Construct the batch data
         prompt_ids, response_ids = [], []
         prompt_attention_mask, response_attention_mask = [], []
@@ -1091,6 +1132,7 @@ class SGLangRollout(BaseRollout):
         multi_modal_inputs = []
         request_ids = []
 
+        # 这些requests输出长度不同，下面的操作就是将输出padding到相同长度/prompt_length
         for req in sorted_output_req_list:
             assert req.state == AsyncRolloutRequestStateEnum.COMPLETED, f"Request {req.request_id} is not completed"
             assert (
@@ -1212,6 +1254,9 @@ class SGLangRollout(BaseRollout):
             batch_size=len(sorted_output_req_list),
         )
 
+        print_debug({'batch': batch}, in_func_name="SGLangRollout._req_level_generate_sequences",
+                annotate_str="after padding request & response",has_bs=False,has_value=True)
+
         # free cache engine
         if self._engine is not None and self._tp_rank == 0:
             loop = asyncio.get_event_loop()
@@ -1266,6 +1311,10 @@ class SGLangRollout(BaseRollout):
             else:
                 _interaction_kwargs = {}
 
+            print_debug({'__tools_kwargs': _tools_kwargs, "_tool_schemas": _tool_schemas, '_interaction_kwargs': _interaction_kwargs}, in_func_name="SGLangRollout._req_level_generate_sequences._preprocess_prompt_to_async_rollout_requests",
+                annotate_str="after prepare tools_kwargs and interaction_kwargs and before create AsyncRolloutRequest",has_bs=False,has_value=True)
+            
+            # 似乎是解析每个样本的请求，准备好input_ids和attention_mask
             req = AsyncRolloutRequest(
                 batch_data_id=data_idx,
                 rollout_offset=0,

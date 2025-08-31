@@ -73,6 +73,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         load_format: str = "dummy_hf",
         layered_summon: bool = True,
     ):
+        # breakpoint()
         self.module = module
         # For AsyncLLM, inference_engine and model_runner are defer initialized in vLLMAsyncRollout.load_model
         self.inference_engine = inference_engine
@@ -131,7 +132,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             work with if isinstance(self.module._fsdp_wrapped_module, PeftModel)
             """
             from peft.utils.save_and_load import get_peft_model_state_dict
-
+            # breakpoint()
             lora_params = OrderedDict()
             peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
             if fsdp_version(self.module) > 0:
@@ -190,6 +191,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         # pytorch: https://pytorch.org/docs/stable/notes/cuda.html#memory-management
         # vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/device_allocator/cumem.py#L103
         self.timing = {}
+        # breakpoint()
+
+        import os
+        pid = os.getpid()
+        print(f"FU [Pid{pid}] before reshard")
+        
         with simple_timer("reshard", self.timing):
             get_torch_device().empty_cache()
 
@@ -331,11 +338,22 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         patch_vllm_moe_model_weight_loader(model)
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+        # temp = (
+        #     (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+        #     for name, param in updated_params.items()
+        # )
+        temp = []
+
+        import os
+        pid = os.getpid()
+        print(f"Fu [Pid{pid}] before full_tensor:",list(updated_params.items())[0][1].to_local().shape)
+        for name, param in updated_params.items():
+            if isinstance(param, DTensor):
+                param = param.to(device, non_blocking=True).full_tensor()
+            temp.append((name, param))
+        print(f"Fu [Pid{pid}] after full_tensor",temp[0][1].shape)
         loaded_params = model.load_weights(
-            (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in updated_params.items()
-            )
+            temp
         )
 
         self.base_sync_done = True

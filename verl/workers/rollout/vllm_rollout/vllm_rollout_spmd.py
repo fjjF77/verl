@@ -316,7 +316,7 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
+            outputs = self.inference_engine.generate( # ？？？这里生成是在哪张卡上？生成前后数据分别在哪张卡上？
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 lora_request=lora_requests,
@@ -340,13 +340,14 @@ class vLLMRollout(BaseRollout):
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
-            )
+            ) # 这里response调整过device
             if self.config.calculate_log_probs:
                 rollout_log_probs = pad_2d_list_to_length(
                     rollout_log_probs, -1, max_length=self.config.response_length
                 ).to(idx.device)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
 
+            import torch
             seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
@@ -380,6 +381,12 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+        
+        import os
+        pid = os.getpid()
+        import torch
+        rank = torch.distributed.get_rank()
+        print(f"Fu [Pid{pid}, rank{rank}] in generate_sequences, batch:{batch.batch_size}, idx device:{idx.device}, response device:{response.device}")
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

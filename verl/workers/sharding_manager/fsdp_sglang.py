@@ -128,6 +128,14 @@ class FSDPSGLangShardingManager(BaseShardingManager):
                 (name, MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor)))
                 for name, tensor in batch
             ]
+            # breakpoint()
+
+            import os
+            pid = os.getpid()
+            import torch
+            rank = torch.distributed.get_rank()
+            print(f"""Fu [Pid{pid}, rank{rank}] (in FSDPSGLangShardingManager.update_weights) after get named_tensors_batch,
+                  named_tensors_batch[0]:{named_tensors_batch[0]}, len:{len(named_tensors_batch)}""")
 
             if self.device_mesh["infer_tp"].get_local_rank() == 0:
                 # On rank 0, prepare a list to hold the gathered batches from all ranks.
@@ -154,6 +162,25 @@ class FSDPSGLangShardingManager(BaseShardingManager):
                 # Example: from [[(n0, t0_tp0), (n1, t1_tp0)], [(n0, t0_tp1), (n1, t1_tp1)]]
                 # to [ ( (n0, t0_tp0), (n0, t0_tp1) ), ( (n1, t1_tp0), (n1, t1_tp1) ) ]
                 logical_tensors = zip(*gathered_serialized_batches, strict=True)
+            
+                named_tensors = [
+                        # 'tensor_group' represents a single logical tensor's data from all ranks.
+                        (
+                            tensor_group[0][0],  # Get the name from the first rank's data.
+                            LocalSerializedTensor(
+                                # 'rank_part' is the (name, serialized_tensor) tuple from one specific rank.
+                                values=[rank_part[1] for rank_part in tensor_group]
+                            ),
+                        )
+                        for tensor_group in logical_tensors
+                        # each tensor_group is like ( (n0, t0_tp0), (n0, t0_tp1) )
+                    ]
+                import os
+                pid = os.getpid()
+                import torch
+                rank = torch.distributed.get_rank()
+                print(f"""Fu [Pid{pid}, rank{rank}] (in FSDPSGLangShardingManager.update_weights) before sglang_engine update_weights_from_tensor,
+                    named_tensors[0]:{named_tensors[0]}, len:{len(named_tensors)}""")
 
                 await self.inference_engine.update_weights_from_tensor(
                     named_tensors=[
@@ -173,14 +200,18 @@ class FSDPSGLangShardingManager(BaseShardingManager):
                 )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
-            await self.inference_engine.flush_cache()
+            await self.inference_engine.flush_cache() 
+            # 虽然KV cache的物理内存已经释放了，但是仍然保留着其索引，因此需要flush_cache刷新radix tree
+            # 这里之所以不使用直接删除KV cache，重新创建KV cache的做法，是因为每次重新创建都会需要重新trace CUDA graph，会带来创建CUDA graph的开销
 
     async def release_memory(self):
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.rollout_config.free_cache_engine:
             await self.inference_engine.release_memory_occupation()
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager enter", logger=logger)
-    async def wake_up(self):
+    async def wake_up(self): 
+        # 这里异步了个寂寞，所有关于异步的调用全用await阻塞执行了。而且本来这个更新逻辑似乎就没法异步了？
+        # 是不是可以FSDP边加载，Sglang边更新？似乎就是slime的更新方式？
         get_torch_device().empty_cache()
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.rollout_config.free_cache_engine:
@@ -194,10 +225,10 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
         if self.offload_param:
             load_fsdp_model_to_gpu(self.module)
-        params = self.module.state_dict()
+        params = self.module.state_dict() #
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-        params = {
+        params = { # ？？？上面不是已经load到GPU上了吗，这里再to是干什么？
             k: v.to(device, non_blocking=True) if fsdp_version(self.module) == 2 else v for k, v in params.items()
         }
 
@@ -252,7 +283,20 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         # TODO: Current impl doesn't consider FSDP with torch micro-dp
         group = self.device_mesh["infer_tp"].get_group()
 
+        import os
+        pid = os.getpid()
+        import torch
+        rank = torch.distributed.get_rank()
+        print(f"Fu [Pid{pid}, rank{rank}] (in FSDPSGLangShardingManager.preprocess_data) before preprocess_data, data bs:{data.batch.batch_size}, data:{data.batch}")
+            
         all_gather_data_proto(data=data, process_group=group)
+
+        import os
+        pid = os.getpid()
+        import torch
+        rank = torch.distributed.get_rank()
+        print(f"Fu [Pid{pid}, rank{rank}] (in FSDPSGLangShardingManager.preprocess_data) after preprocess_data, data bs:{data.batch.batch_size}, data:{data.batch}")
+            
         return data
 
     def postprocess_data(self, data: DataProto) -> DataProto:

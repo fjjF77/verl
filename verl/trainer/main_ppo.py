@@ -58,6 +58,9 @@ def run_ppo(config) -> None:
         ray.init(
             runtime_env=get_ppo_ray_runtime_env(),
             num_cpus=config.ray_init.num_cpus,
+            local_mode=False,
+            log_to_driver=True,
+            logging_level="INFO",
         )
 
     # Create a remote instance of the TaskRunner class, and
@@ -106,6 +109,8 @@ class TaskRunner:
         from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        breakpoint()
+
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
@@ -167,7 +172,7 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
         # Map roles to their corresponding remote worker classes.
-        role_worker_mapping = {
+        role_worker_mapping = { # 并非示例化对象，而是装饰为ray远程actor类
             Role.ActorRollout: ray.remote(actor_rollout_cls),
             Role.Critic: ray.remote(CriticWorker),
         }
@@ -220,6 +225,7 @@ class TaskRunner:
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
+        breakpoint()
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
             config=config,

@@ -25,6 +25,8 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast, Processor
 from verl.tools.schemas import OpenAIFunctionToolCall, OpenAIFunctionToolSchema
 from verl.utils.model import compute_position_id_with_mask
 
+from utils.fu_learn_utils import print_debug
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -147,6 +149,7 @@ class AsyncRolloutRequest(BaseModel):
             [tool.model_dump() for tool in tool_schemas] if (tool_schemas := values.get("tool_schemas", [])) else None
         )
 
+        # （TODO）分别生成不含生成提示的tokenization结果和包含生成提示的tokenization结果，这个似乎在verl的文档里看到过原因
         multi_modal_data = values["multi_modal_data"]
         tokens_without_prompt = cls._handle_apply_chat_template(
             processing_class,
@@ -156,6 +159,17 @@ class AsyncRolloutRequest(BaseModel):
             add_generation_prompt=False,
             tokenize=True,
         )
+        
+        fu_prompts_without_prompt = cls._handle_apply_chat_template(
+            processing_class,
+            messages,
+            multi_modal_data=multi_modal_data,
+            tools=tools,
+            add_generation_prompt=False,
+            tokenize=False,
+        )
+
+        fu_prompts_dict_with_prompt =None
         if (
             values.get("input_ids") is None
             or values.get("attention_mask") is None
@@ -168,6 +182,16 @@ class AsyncRolloutRequest(BaseModel):
                 tools=tools,
                 add_generation_prompt=True,
                 tokenize=True,
+                return_dict=True,
+            )
+
+            fu_prompts_dict_with_prompt = cls._handle_apply_chat_template(
+                processing_class,
+                messages,
+                multi_modal_data=multi_modal_data,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=False,
                 return_dict=True,
             )
 
@@ -214,6 +238,34 @@ class AsyncRolloutRequest(BaseModel):
             tokenize=True,
         ).shape[-1]
 
+
+        values["fu_debug_base_conv_wo_gen_prompt_end_pos"] = cls._handle_apply_chat_template(
+            processing_class,
+            BASE_CHAT_HISTORY,
+            multi_modal_data=multi_modal_data,
+            tools=tools,
+            add_generation_prompt=False,
+            tokenize=False,
+        ).shape[-1]
+
+        values["fu_debug_base_conv_with_gen_prompt_end_pos"] = cls._handle_apply_chat_template(
+            processing_class,
+            BASE_CHAT_HISTORY,
+            multi_modal_data=multi_modal_data,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False,
+        ).shape[-1]
+
+        values['fu_debug_tokens_without_prompt'] = fu_prompts_dict_with_prompt
+        values['fu_debug_tokenization_dict_with_prompt'] = fu_prompts_dict_with_prompt
+
+        print_debug({'values': values}, in_func_name="AsyncRolloutRequest.initialize_request",
+                annotate_str="initialize_request over",has_bs=False,has_value=True)
+        
+        # （TODO）这个都是token id形式的，不打断点调试不方便
+        breakpoint()
+
         return values
 
     @staticmethod
@@ -226,6 +278,7 @@ class AsyncRolloutRequest(BaseModel):
         tokenize: bool = False,
         return_dict: bool = False,
     ):
+        # 应用apply_chat_template，假如有多模数据的话也会调用processer
         raw_prompt = processing_class.apply_chat_template(
             messages, tools=tools, add_generation_prompt=add_generation_prompt, tokenize=False
         )
@@ -348,6 +401,7 @@ class AsyncRolloutRequest(BaseModel):
 
         Because rollout engine(SGLang) requires the ids to be a list, we need to convert the tensor to a list.
         """
+        # 这部分是干什么的？
         generation_prompt_ids = (
             None
             if self.input_ids[..., -self.generation_prompt_ids.shape[-1] :].eq(self.generation_prompt_ids).all()
@@ -393,6 +447,7 @@ class AsyncRolloutRequest(BaseModel):
         content: str,
         tool_calls: Optional[list[OpenAIFunctionToolCall]] = None,
     ) -> None:
+        # 添加assistant消息，具体有assistant prompt，tool调用相关描述。然后更新input_ids，attn_mask等
         self.messages.append(Message(role="assistant", content=content, tool_calls=tool_calls))
 
         messages = [*BASE_CHAT_HISTORY, self.messages[-1]]
@@ -410,6 +465,7 @@ class AsyncRolloutRequest(BaseModel):
         processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
         contents: list[str | dict[str, Any]],
     ) -> None:
+        # 处理工具输出结果的原始文本，得到openai的格式，并更新input_ids等值
         if not contents:
             return
         # We also handle the case when tool returns image

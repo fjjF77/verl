@@ -177,7 +177,7 @@ def load_fsdp_model_to_gpu(model: FSDP):
     assert isinstance(model, FSDP)
     # lazy init FSDP model
     _lazy_init(model, model)
-    assert model._is_root, "Only support root model loading to GPU"
+    assert model._is_root, "Only support root model loading to GPU" # ？？？
     device_id = get_device_id()
     for handle in model._all_handles:
         if handle._offload_params:

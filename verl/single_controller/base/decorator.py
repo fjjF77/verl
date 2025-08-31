@@ -342,6 +342,16 @@ def dispatch_dp_compute_data_proto(worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
 
     assert isinstance(worker_group, WorkerGroup)
+
+    import os
+    pid = os.getpid()
+    import torch
+    try:
+        rank = torch.distributed.get_rank()
+    except ValueError:
+        rank = None
+    print(f"Fu [Pid{pid}, rank{rank}] begin dispath_dp_compute_data_proto, worker_group.world_size:{worker_group.world_size}")
+
     # Note: enable auto padding for dp compute DatapProto
     splitted_args, splitted_kwargs = _split_args_kwargs_data_proto_with_auto_padding(
         worker_group.world_size,
@@ -371,6 +381,18 @@ def collect_dp_compute_data_proto(worker_group, output):
         assert isinstance(o, DataProto | ray.ObjectRef), f"expecting {o} to be DataProto, but got {type(o)}"
 
     output = collect_dp_compute(worker_group, output)
+
+    import os
+    pid = os.getpid()
+    import torch
+    try:
+        rank = torch.distributed.get_rank()
+    except ValueError:
+        rank = None
+    print(f"Fu [Pid{pid}, rank{rank}] before concat_data_proto, output:{output}")
+
+    breakpoint() # 检查这里为什么output结果似乎都在一张卡上，没有gather的操作(因为fun_generator中实现是out=ray.get(ref));同时查看collect的调用栈是什么样的，到底在哪儿执行了这个函数（具体查看ray.base.func_generator）
+
     return _concat_data_proto_or_future(output)
 
 
@@ -522,6 +544,8 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
         wrapper = async_inner if inspect.iscoroutinefunction(func) else inner
         attrs = {"dispatch_mode": dispatch_mode, "execute_mode": execute_mode, "blocking": blocking}
         setattr(wrapper, MAGIC_ATTR, attrs)
+
+        # breakpoint() # 查看数据分发和收集是怎么进行的？没用，这里是在引用的时候调用的
         return wrapper
 
     return decorator
